@@ -7,8 +7,8 @@ from torch import optim
 import sys
 from copy import deepcopy
 
-sys.path.append('../')
-from data_utils.gai_data_factory import GetDataset
+sys.path.append('../../')
+from mygcast.data_utils.gai_data_factory import GetDataset
 
 from losses import loss as loss_func
 from tqdm import tqdm
@@ -63,9 +63,12 @@ class MyGNN_OneStep(nn.Module):
         # 边特征更新
         cur_e_h = g.edges[etype].data['e_h'].clone()
         g.edges[etype].data['e_h'] = self.interact_edge_embedding(
-            torch.cat([g.edges[etype].data['e_h'],
-                       g.nodes[srcnodetype].data['h'][g.edges(etype=(srcnodetype, etype, dstnodetype))[0]],
-                       g.nodes[dstnodetype].data['h'][g.edges(etype=(srcnodetype, etype, dstnodetype))[1]]], dim=2))
+            torch.cat([
+                g.edges[etype].data['e_h'],
+                g.nodes[srcnodetype].data['h'][g.edges(etype=(srcnodetype, etype, dstnodetype))[0]],
+                g.nodes[dstnodetype].data['h'][g.edges(etype=(srcnodetype, etype, dstnodetype))[1]]
+            ], dim=2)
+        )
 
         # 消息传递
         def message_func(edges):
@@ -230,7 +233,7 @@ if __name__ == '__main__':
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
-    # use gen_one_g to generate graph
+
     graphs = dgl.load_graphs('../gen_g_utils/l_graphcast.dgl')[0][0]
     graphs = graphs.to(device)
 
@@ -250,35 +253,40 @@ if __name__ == '__main__':
     optimizer = optim.AdamW(graphcastmodel.parameters(), lr=1e-3, weight_decay=0.1, betas=(0.9, 0.95))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    upper_path = '/upperdata'
-    surface_path = 'surfacedata'
+    upper_path = '/mnt/data/cra_h5/upper/train/'
+    surface_path = '/mnt/data/cra_h5/surface_linear/train/'
     dataset = GetDataset(upper_path=upper_path, surfa_path=surface_path)
     loader = DataLoader(dataset=dataset, batch_size=batch_size, num_workers=8)
     loader_len = len(loader)
     # 使用accelerator.prepare准备模型、优化器和数据加载器
     graphcastmodel, optimizer, loader = accelerator.prepare(graphcastmodel, optimizer, loader)
     last_train_location = -1
-    save_path = './checkpoint/9999'
-    if os.path.exists(save_path):
-        checkpoint = torch.load('./checkpoint/9999/graphcastmodel.tar', map_location='cpu')
+    saved_path = './checkpoint/0011/'
+    if os.path.exists(saved_path):
+        checkpoint = torch.load(saved_path + 'graphcastmodel.tar', map_location='cpu')
+        # 更新 scheduler用
         global_steps = checkpoint['iters']
         startEpoch = checkpoint['epoch']
         if 'num_gpus' not in checkpoint:
             num_gpus = 4
         else:
             num_gpus = checkpoint['num_gpus']
-        global_steps = (global_steps * num_gpus) % loader_len
-        global_steps = int(global_steps / accelerator.num_processes)
+        # 获取dataloader的位置
+        train_steps = (global_steps * num_gpus) % loader_len
+        train_steps = int(global_steps / accelerator.num_processes)
         accelerator.unwrap_model(graphcastmodel).load_state_dict(checkpoint['model_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler'])
-        print(f"last train location: epoch:\\n {startEpoch} || step:{global_steps}")
+        print(f"last train location: epoch: \n {startEpoch} || step:{global_steps}")
         last_train_location = 0
 
     accum_iter = int(32 / (batch_size * accelerator.num_processes))  # 调整 accum_iter，使总批量大小为32
     print(f"累计梯度 {accum_iter}")
+
+    print(f"global_steps:{global_steps:06d}")
+    last_train_location = -1
     if last_train_location == -1:
-        for epoch in range(startEpoch, 30):
+        for epoch in range(startEpoch, 300):
             total_loss = 0.
             for i, (input_data, label_data) in enumerate(tqdm(loader, disable=not accelerator.is_local_main_process)):
 
@@ -308,16 +316,16 @@ if __name__ == '__main__':
                     current_lr = scheduler.get_last_lr()[0]
                     if accelerator.is_local_main_process:
                         tqdm.write(
-                            f"Epoch: {epoch:02d} || steps : {int(global_steps / accum_iter):05d} || Loss: {total_loss / accum_iter:.4f} || Current LR: {current_lr:.8f}")
+                            f"Epoch: {epoch:02d} || steps : {int(global_steps / accum_iter):06d} || Loss: {total_loss / accum_iter:.4f} || Current LR: {current_lr:.8f}")
                         total_loss = 0.
                     optimizer.step()  # 更新参数
                     optimizer.zero_grad()  # 清除梯度
                     scheduler.step(int(global_steps / accum_iter))  # 更新学习率
 
                     # 每100步保存一次模型
-                    if int(global_steps / accum_iter) % 100 == 0:
+                    if global_steps % (accum_iter * 500) == 0:
                         if accelerator.is_local_main_process:
-                            checkpoint_dir = f'./checkpoint/{int(global_steps / (100 * accum_iter)):04d}'
+                            checkpoint_dir = f'./checkpoint/{int(global_steps / (500 * accum_iter)):04d}'
                             if not os.path.exists(checkpoint_dir):
                                 os.mkdir(checkpoint_dir)
                             # 保存模型和优化器状态
@@ -345,7 +353,7 @@ if __name__ == '__main__':
                     label_data = label_data.to(device)
                 pred_feat = graphcastmodel(graphs, input_data).permute(1, 0, 2)
                 loss = loss_func(label_data, pred_feat, torch.linspace(90, -90, 721).to(device),
-                                 torch.FloatTensor([1, .1, .1, .1, .1]).to(device))
+                                 torch.FloatTensor([0.1, 0.1, 0.1, 1, 0.1]).to(device))
 
                 # 聚合所有设备的损失
                 losses = accelerator.gather(loss)

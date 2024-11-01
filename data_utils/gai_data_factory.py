@@ -9,11 +9,14 @@ from torch import Tensor
 import h5py
 import math
 from tqdm import tqdm
+import pandas as pd
+
+# from solar import get_toa_incident_solar_radiation_for_torch
 
 
 class GetDataset(Dataset):
     def __init__(self, upper_path, surfa_path, start_year=2002,
-                 end_year=2022, preci=False, time_step=1, samp_step=1, in_length=2, out_length=1, ):
+                 end_year=2022, preci=False, time_step=1, samp_step=1, in_length=2, out_length=1, use_sloar=False):
         self.upper_path = upper_path
         self.surfa_path = surfa_path
         self.time_step = time_step
@@ -32,7 +35,11 @@ class GetDataset(Dataset):
         self.surface_std = np.sqrt(
             np.mean(np.load('/mnt/data/cra_h5/surface_linear/stat_np/surface_var_22_79.npy'), axis=0).squeeze(0))
 
-        self.add_data = [self._addition_feature(1458, year) for year in range(start_year, end_year)]
+        self.add_data = [self._addition_feature(1458, year) for year in range(start_year, end_year + 1)]
+        self.days_data = [pd.date_range(
+            f'{year}-01-01 00:00:00', end=f'{year}-12-31 23:59:59', freq='6h'
+        ).to_numpy(dtype='datetime64[ns]') for year in range(start_year, end_year + 1)]
+        self.use_sloar = use_sloar
     def _get_files_stats(self):
         self.upper_files = glob.glob(self.upper_path + "/*.h5")
         self.surfa_filea = glob.glob(self.surfa_path + "/*.h5")
@@ -60,7 +67,7 @@ class GetDataset(Dataset):
         self.sfiles = {year_idx: h5py.File(self.surfa_filea[year_idx], 'r', libver='latest', swmr=True) for year_idx in
                        range(self.n_years)}
 
-    def _addition_feature(self,  n_steps, st_year):
+    def _addition_feature(self, n_steps, st_year):
         import pandas as pd
         # Define some constants
         SEC_PER_HOUR = 3600
@@ -100,6 +107,7 @@ class GetDataset(Dataset):
             "day_progress_sin": np.sin(day_progress * 2 * np.pi).squeeze(0),
             "day_progress_cos": np.cos(day_progress * 2 * np.pi).squeeze(0)
         }
+
     def __len__(self):
         return self.n_samples_total
 
@@ -107,7 +115,6 @@ class GetDataset(Dataset):
         year_idx = int(global_idx / self.n_samples_per_year)  # which year we are on
         local_idx = int(
             global_idx % self.n_samples_per_year)  # which sample in that year we are on - determines indices for centering
-
 
         start_i = local_idx * self.samp_step
         end_i = local_idx * self.samp_step + (self.in_length + self.out_length) * self.time_step
@@ -122,7 +129,6 @@ class GetDataset(Dataset):
         upper_data = torch.as_tensor(upper_data, dtype=torch.float32)
         surfa_data = torch.as_tensor(surfa_data, dtype=torch.float32)
 
-
         input_data_upper = torch.stack((upper_data[0], upper_data[1]), axis=0).permute(-2, -1, 0, 1, 2)
         input_data_surface = torch.stack((surfa_data[0], surfa_data[1]), axis=0).permute(-2, -1, 0, 1)
 
@@ -131,16 +137,24 @@ class GetDataset(Dataset):
         input_data = torch.FloatTensor(np.concatenate((input_data_upper, input_data_surface), axis=-1))
 
         a = torch.FloatTensor(self.add_data[year_idx]['year_progress_sin'][start_i: end_i: self.time_step]).expand(721,
-                                                                                                               1440, -1)
+                                                                                                                   1440,
+                                                                                                                   -1)
         b = torch.FloatTensor(self.add_data[year_idx]['year_progress_cos'][start_i: end_i: self.time_step]).expand(721,
-                                                                                                               1440, -1)
+                                                                                                                   1440,
+                                                                                                                   -1)
         c = torch.FloatTensor(
-            self.add_data[year_idx]['day_progress_sin'][start_i: end_i: self.time_step].reshape(1440, -1)).expand(
+            self.add_data[year_idx]['day_progress_sin'][start_i: end_i: self.time_step]).permute(1, 0).expand(
             721, -1, -1)
         d = torch.FloatTensor(
-            self.add_data[year_idx]['day_progress_cos'][start_i: end_i: self.time_step].reshape(1440, -1)).expand(
+            self.add_data[year_idx]['day_progress_cos'][start_i: end_i: self.time_step]).permute(1, 0).expand(
             721, -1, -1)
-        forcing_data = torch.concat([a, b, c, d], dim=2).reshape(721 * 1440, -1)
+        if self.use_sloar:
+            # sloars = get_toa_incident_solar_radiation_for_torch(
+            # self.days_data[year_idx][start_i: end_i: self.time_step]).permute(1, 2, 0)
+            # forcing_data = torch.concat([a, b, c, d, sloars], dim=2).reshape(721 * 1440, -1)
+            forcing_data = torch.concat([a, b, c, d], dim=2).reshape(721 * 1440, -1)
+        else:
+            forcing_data = torch.concat([a, b, c, d], dim=2).reshape(721 * 1440, -1)
         input_data = torch.concat([input_data, forcing_data], dim=1)
 
         # label
@@ -153,6 +167,7 @@ class GetDataset(Dataset):
 
         return input_data, label_data
 
+
     def __del__(self):
         # 在析构时关闭所有打开的文件
         for year_idx in self.ufiles:
@@ -162,14 +177,13 @@ class GetDataset(Dataset):
 
 
 if __name__ == '__main__':
-    '''
-    数据均为.h5文件
-    '''
-    upper_path = 'upper_data'
-    surface_path = 'surface_data'
+    upper_path = '/mnt/data/cra_h5/upper/train/'
+    surface_path = '/mnt/data/cra_h5/surface_linear/train/'
     dataset = GetDataset(upper_path=upper_path, surfa_path=surface_path)
     # subset = Subset(dataset, range(720, len(dataset)))
 
-    laoder = DataLoader(dataset, shuffle=False, batch_size=2, num_workers=6)
-    for data in tqdm(laoder):
+    laoder = DataLoader(dataset, shuffle=False, batch_size=2, num_workers=10)
+    for i, data in enumerate(tqdm(laoder)):
+        if i == 14579:
+            pass
         pass
